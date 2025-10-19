@@ -1,4 +1,4 @@
+library(readr)
 library(tidyverse)
-
-print("hello")
-print("Byeeee")
+data <- read_csv("archive/healthcare-dataset-stroke-data.csv")
+head(data)
