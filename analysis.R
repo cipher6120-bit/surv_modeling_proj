@@ -1,7 +1,6 @@
 library(readr)
 library(survival)
 library(tidyverse)
-library(chattr)
 library(mice)
 library(MASS)
 data <- read_csv("archive/healthcare-dataset-stroke-data.csv")
