@@ -9,8 +9,7 @@ library(MASS)
 #massive thanks to fedesoriano for providing the dataset
 data <- read_csv("archive/healthcare-dataset-stroke-data.csv")
 
-# Data overview
-cat("Data overview:\n")
+# take a look at the data
 print(data, width = 100)
 summary(data)
 
@@ -87,4 +86,31 @@ plot(km_fit_smoking_final, col = 1:2, xlab = "Age", ylab = "Survival Probability
 legend("bottomright", legend = levels(imputed_complete_data$smoking_status), 
        col = 1:2, lty = 1, cex = 0.8)
 
+aic_model_zph <- cox.zph(aic_model)
+aic_model_zph$table
+#bmi might not have proportional hazard
+#let's plot out the hazard rate over time
+#plot the 3 graphs side by side
+plot(aic_model_zph[1], main = "Scaled Schoenfeld Residuals for Avg Glucose Level")
+plot(aic_model_zph[2], main = "Scaled Schoenfeld Residuals for BMI")
+plot(aic_model_zph[3], main = "Scaled Schoenfeld Residuals for Smoking Status")
+#it is not too bad, and the p value isn't horribly low
+#might worth it to keep it in the model
+#the smoking status have a odd shape though
+#might be due to noise? IDK
 
+#the residuals for BMI looks like it's sort of monotonically decreasing
+#can try to fit a model with time variant coefficient
+bmi_time_var_model <- coxph(stroke.surv ~ bmi + bmi : age, data = imputed_complete_data)
+summary(bmi_time_var_model)
+bmi_model_zph <- cox.zph(bmi_time_var_model)
+bmi_model_zph$table
+plot(bmi_model_zph[1])
+plot(bmi_model_zph[2])
+#p-values don't look that promising
+#but the plots have pretty flat lines
+#maybe the Schoenfeld residual got a bit funky with the introduction of the interaction term
+#I can live with the AIC model.
+
+#Onur suggested that maybe imputing the missing data wasn't the most robust
+#I can do a separate analysis and drop the unknown smoking status
