@@ -1,0 +1,554 @@
+---
+title: "An exercise on survival analysis and multiple imputation techniques using stroke data"
+author: "Lui Yiu Wa"
+date: "2025-11-04"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Data source and goal
+
+## Source of data
+https://www.kaggle.com/datasets/fedesoriano/stroke-prediction-dataset/data
+
+Provided by user Fedesoriano
+
+# Introduction
+
+The primary goal of this project was a pedagogical exercise to implement and analyze a series of survival analysis and missing-data handling techniques. The main focus of this project is on the techniques themselves rather than establishing a definitive scientific conclusion on the risk of getting a stroke even though it will be used as a heuristic motivation to guide this project. Another objective of this project is to recognize the limitations of this data set and why it is not ideal for a survival analysis.
+
+The data set used in this analysis contains multiple attributes including the variables about their health as well as the status of their occupation and personal life. There are missing values on smoking status and BMI of the respondents. It provides us an opportunity to apply multiple imputation technique and comparing it to complete case analysis.
+
+I will take the age at which a stroke could occur as the response variable that we would like to learn more about or predict using the covariates available.
+
+## Goal of the analysis:
+
+1. Use non-parametric methods to visualize the empirical survival function
+2. Use semi-parametric methods to investigate what variables significantly increase the risk of getting a stroke
+3. Handling sparse events
+4. Investigate whether the common proportional hazard assumption holds. If not, what could the remedy be?
+5. Compare analysis with multiple imputation data set vs complete case analysis
+6. Recognize the limitation of our analysis
+7. Have fun!
+
+# Limitation on our data set
+
+The dataset that I will be using for this project provides the age at event or censoring, but not the age at study entry. The sampling method was not specified by the author, and without further information, the best available course is to assume every subject entered the study at birth. However, this assumption has a significant chance of being wrong, as a study lasting over 90 years is unlikely, and it would introduce a bias, specifically, an underestimation of risk. Ideally, we could account for this left truncation with entry age information, this means we will only include a subject in our risk set when they have entered our study. But for now, we will move forward while keeping this limitation in mind.
+
+# Initial data assessment and data cleaning
+
+First, we need to load the libraries that we will need for this analysis
+```{r message=FALSE, warning=FALSE}
+library(readr)
+library(survival)
+library(tidyverse)
+library(mice)
+library(MASS)
+library(AMR)
+library(car)
+```
+
+Load the data set used in this analysis
+```{r}
+data <- read_csv("archive/healthcare-dataset-stroke-data.csv")
+```
+
+We can first have an overview of the data itself
+```{r}
+print(data, width = Inf)
+summary(data)
+```
+
+We see some variables are not using the data types that we are expecting
+
+Let's quickly convert them to the ones that we need
+
+```{r}
+data_clean <- data %>% mutate(
+  id = as.character(id),
+  age = as.numeric(age),
+  avg_glucose_level = as.numeric(avg_glucose_level),
+  bmi = as.numeric(bmi),
+  across(c(gender, hypertension, heart_disease, ever_married,
+           work_type, Residence_type, smoking_status), as.factor)
+  
+)
+
+print(data, n = 5, width = Inf)
+```
+We can also see the tables for all the factor variables
+
+```{r}
+table(data_clean$gender)
+table(data_clean$hypertension, useNA = "always")
+table(data_clean$heart_disease, useNA = "always")
+table(data_clean$ever_married, useNA = "always")
+table(data_clean$work_type, useNA = "always")
+table(data_clean$Residence_type, useNA = "always")
+table(data_clean$smoking_status, useNA = "always")
+table(data_clean$stroke, useNA = "always")
+```
+No NA values appear.
+
+But we notice gender == "Other" has only 1 observation, we should disregard that observation because it will likely produce unstable result in our analysis
+
+# Challenge: Checking for NA values, sparse events and converting implicitly missing data into explicit NA values
+
+```{r}
+data_clean <- data_clean %>% filter(gender != "Other")
+data_clean <- data_clean %>% droplevels.data.frame()
+```
+
+And we also notice for smoking status, we have an "Unknown" level, which we can treat as having NA values
+
+```{r}
+data_clean <- data_clean %>% mutate(
+  smoking_status = ifelse(smoking_status == "Unknown", NA, 
+                            as.character(smoking_status)) %>% as.factor()
+)
+```
+
+We should also check for missing values in numeric variables
+
+```{r}
+sapply(data_clean %>% dplyr::select(age, avg_glucose_level, bmi), function(x) sum(is.na(x)))
+```
+
+We have 201 missing values in bmi
+
+# Handling missing values
+
+Now that we have noticed that there are a good amount of observations that of NA values. We have 2 common ways to deal with such observations. We can either do a multiple imputation or we can simply drop the observations with NA values, a so called complete case analysis.
+
+Or we can do both and compare the results. Such practice is called a sensitivity analysis.
+
+We can start with either one but I opted to do my initial analysis with the multiple imputation approach.
+
+# Imputing the missing values
+
+We may use the MICE library to help us do the imputation. Note that for imputation to be valid, we assume the data to be missing at random (MAR). Which means the probability of a data point missing is dependent on the observed data, but not the missing data. If the data is not missing at random (MNAR) meaning the probability of a data point missing also depends on the missing data, then this problem becomes exceptionally difficult to handle, at least, too difficult for me to handle. But let's just assume MAR is what we are dealing with for now.
+
+I decided to use a simple default chain with 5 chains, 50 iterations each and used predictive mean matching. This will work well enough for a simple data set like ours.
+
+```{r message=FALSE, include=FALSE}
+imputed_data <- mice(data_clean, m = 5, maxit = 50, method = 'pmm', seed = 123)
+imputed_complete_data <- as_tibble(complete(imputed_data)) #This is simply one instance of the imputation
+```
+
+Let's see if our imputation has worked properly
+```{r}
+sum(is.na(imputed_complete_data$smoking_status))
+sum(is.na(imputed_complete_data$bmi))
+```
+
+# MICE diagnostics
+We need to see if the imputed data make sense. Ideally, the imputed data should have similiar distribution as the observed data.
+
+```{r}
+mice::densityplot(imputed_data, ~bmi)
+mice::densityplot(imputed_data, ~smoking_status)
+
+```
+It seems that the distribution of the imputed data and observed data are quite similar, we can be confident that our imputed data are reasonable.
+
+
+# Initial exploration and visualization
+
+We can first create a survival object
+
+```{r}
+stroke.surv <- Surv(imputed_complete_data$age, imputed_complete_data$stroke)
+```
+
+We can visualize the empirical survival function with Kaplan-Meier curve, and one thing we can do is to stratify our data into groups and show their respective survival curves. Take gender for example
+
+```{r}
+km_fit_gender <- survfit(stroke.surv ~ gender, data = imputed_complete_data)
+plot(km_fit_gender, col = 1:2, xlab = "Age", ylab = "Survival Probability", 
+     main = "Kaplan-Meier Survival Curves by Gender", xlim = c(40,90))
+legend("bottomright", legend = levels(imputed_complete_data$gender), 
+       col = 1:2, lty = 1, cex = 0.8)
+```
+It doesn't seem like there is that big of a difference, but remember it is only a visual test.
+
+We can also do the same for smoking status. However, note that we have imputed smoking status, and we have produced 5 data sets with different imputed values, we can either plot the curves 5 times or just arbitrarily pick one data set and plot the curve that corresponds to it. Neither of these are very helpful. It is better for us to use other techniques.
+
+# Initial assessment the effect of smoking and BMI on the risk of getting a stroke
+
+To see if smoking status has an effect on the survival function, we can investigate how smoking affects the risk of one getting a stroke. One popular way to do it is by the Cox Proportional Hazard model.
+
+Again we have 5 data sets so we need to fit the model 5 times. Then we can average the estimates and compute the total variance which is contributed by the inherent randomness of the data as well as the different imputed values between data sets using Rubin's rules.
+
+It sounds tedious but fortunate for us, some incredibly intelligent people have already done the hard work for us, all we need is to call some functions
+
+```{r}
+imputed_smokes_ph <- with(imputed_data, coxph(stroke.surv ~ smoking_status))
+pooled_smokes_ph <- pool(imputed_smokes_ph)
+summary(pooled_smokes_ph)
+```
+Oof, it seems like our p-value is not great. But it is not the end of the world. Let's take a look at the point estimate.
+
+Remember, the base level is formerly smoked, so we are comparing the relative risk of never_smoked (or smokes) to formerly_smoked. And the result is simply e^(estimate).
+
+So people who never smoked have roughly e^(-0.176) (or 0.839) the risk of people who formerly smoked. And people who smokes have roughly e^(0.188) (or 1.21) the risk.
+
+Seems reasonable. And it also aligns with the general consensus that smoking increases your risk of having a stroke.
+
+Even though the p value is not amazing, I would argue it might still be worth it to keep smoking status as a variable in our model for now.
+
+We can also do the same for bmi
+
+```{r}
+imputed_bmi_ph <- with(imputed_data, coxph(stroke.surv ~ bmi))
+pooled_bmi_ph <- pool(imputed_bmi_ph)
+summary(pooled_bmi_ph)
+```
+
+This time, it is pretty clear cut that bmi is a significant variable, we can feel pretty confident to proceed with our modeling.
+
+# Further investigation on other covariates.
+
+Let's now try to fit a multivariate model. For practicality, I am inclined to use only one instance of the imputation, we have to keep in mind that our estimation will likely be overconfident.
+
+Note that using all the covariates in our model and see what are significant is NOT a good practice in general. It is called a kitchen sink model. Ideally, we should have some specific hypothesis we wish to test before running the analysis. But here, I am just trying to see if anything "funky" is going on so I can further clean up the data. The goal here is not to make any inference.
+
+```{r warning=FALSE}
+imputed_full_ph <- coxph(stroke.surv ~ . - id - age - stroke, data = imputed_complete_data)
+summary(imputed_full_ph)
+```
+
+We see the work_type is behaving very strangely, let's investigate further!
+
+# Further data cleaning
+
+```{r}
+table(imputed_complete_data$work_type, imputed_complete_data$stroke)
+```
+Ha, we see that our base case children has very low risk of getting a stroke (surprise to no one), so the relative risk becomes very unstable. Also, work_type == "Never_worked" has no observation that has ever had a stroke. That can also lead to unstable results.
+
+So, it is apparent that cox_ph may not handle this variable well without doing a lot of pre-processing, but we also want to see if work_type has a significant effect on stroke risk. 
+
+In this case, I will simply use the likelihood test on the contingency table. But, there are cells that have very little observation, we need to be careful with the results
+
+```{r}
+work_type_stroke_table <- table(imputed_complete_data$work_type, imputed_complete_data$stroke)
+g.test(work_type_stroke_table)
+```
+Alternatively, we can artificially conflate the observation of each cells by 5, 10 and 15. Or we could use a Fischer's exact test.
+```{r}
+g.test(work_type_stroke_table + 5)
+g.test(work_type_stroke_table + 10)
+g.test(work_type_stroke_table + 15)
+```
+It looks like no matter what we get a significant result, that is to say, work type probably has a significant effect on the risk of getting a stroke.
+
+We can try to use a different base level for our regression.
+
+```{r}
+imputed_complete_data$work_type <- relevel(imputed_complete_data$work_type, ref = "Govt_job")
+imputed_full_ph <- coxph(stroke.surv ~ . - id - age - stroke, 
+                         data = imputed_complete_data)
+summary(imputed_full_ph)
+```
+
+This time we can capture that there is a significant difference between Self_employed and Govt_job.
+
+I have one more idea, and that is to regroup them and see if there is a difference
+
+```{r}
+imputed_complete_data_collapse <- imputed_complete_data %>% mutate(
+ work_type = fct_collapse(work_type,
+    Govt_job = "Govt_job",
+    'Self-employed' = "Self-employed",
+    Other = c("children", "Never_worked", "Private")
+  )
+)
+```
+```{r}
+imputed_collapse_full_ph <- coxph(stroke.surv ~ . - id - age - stroke, data = imputed_complete_data_collapse)
+summary(imputed_collapse_full_ph)
+```
+This avoid some categories from having 0 or very sparse stroke events, and any models that uses work_type as a covariate should behave better now.
+
+# Checking collinearity.
+
+Now we also need to check for collinearity, we can do so by running a linear regression on a made up response with the covariates, and calculate the variance inflation factor. 
+
+```{r}
+lm_for_vif <- lm(rnorm(n = nrow(imputed_complete_data_collapse)) ~ . - id - age - stroke,
+                 data = imputed_complete_data_collapse)
+vif(lm_for_vif)
+```
+VIF looks good as they are all below the common cut off of 5, collinearity should not be a concern. We can proceed.
+
+# Model selection
+
+Now we want to select variables that best explain the response. And there are some modern methods such as LASSO, RIDGE, principle component analysis and data scientists' favorite: Cross validation.
+
+These are all fantastic choice they are a bit cumbersome to implement. Because model selection is not the main focus of this project I will opt for AIC/BIC stepwise selection for an easier and quicker implementation. But note that these 2 are almost always inferior choices as they don't deal with collinearity as well, and less stable variable selection. Between the 2, AIC is better than BIC for prediction as it has a more lenient penalty term for extra variables. Where as BIC is better for identifying the true model given that the true model is in our set of candidate models. And they are asymptotically equivalent to cross validation with different values of k.
+
+AIC model:
+```{r echo=T, results='hide'}
+aic_model <- step(imputed_collapse_full_ph, k = 2, direction = "both")
+```
+
+```{r}
+summary(aic_model)
+```
+
+BIC model:
+```{r echo=T, results='hide'}
+bic_model <- step(imputed_collapse_full_ph, 
+                  k = log(nrow(imputed_complete_data_collapse)), 
+                  direction = "both")
+```
+
+```{r}
+summary(bic_model)
+```
+
+As expected, BIC imposes a much stricter penalty term and only takes work type as the only predictor whereas AIC takes work type, average glucose level and bmi as predictors.
+
+There is nothing that stops us from adding smoking into either of this model as long as it is emprically and clinically valid (Let's assume it is). I am more inclined to add smoking status to the AIC model for the better prediction performance.
+
+```{r}
+aic_model_with_smoke <- coxph(stroke.surv ~ work_type 
+                              + avg_glucose_level + bmi + smoking_status,
+                   data = imputed_complete_data_collapse)
+summary(aic_model_with_smoke)
+```
+
+So smoking is still not that significant, but leaving it in our model does have a nice interpretation in our model. Never smokes has the lowest risk of getting a stroke, formerly smoked is somewhere in between and smoking has the highest risk. One may consider leaving it in our model.
+
+And the work type "Other" does not have significantly different effect on the risk compared to government jobs.
+
+And all the other covariates are significant.
+
+Before we are done here, there is still one thing that we must do, and that is to check if our Cox-proportional-hazard model is appropriate. That is to say, are the proportional hazard assumption violated?
+
+# Checking the validity of proportional hazard assumption
+
+First thing to check is that are the covariate time invariant, that is to say, after the subject has entered our study, can the covariates' values change? If so, we should account for them by using time variant analysis. However, in this data set, we don't have that luxury to know if this assumption hold because we don't know how the study is conducted. Not much we can do other than to recognize this limitation.
+
+Second thing to check is that are the coefficient time invariant? i.e. given 2 groups, their relative hazard should be proportional at all time. This we can actually check by scaled Schoenfeld residual.
+
+```{r}
+aic_model_with_smoke_zph <- cox.zph(aic_model_with_smoke)
+aic_model_with_smoke_zph$table
+
+plot(aic_model_with_smoke_zph[1], main = "Scaled Schoenfeld Residuals for work type")
+plot(aic_model_with_smoke_zph[2], main = "Scaled Schoenfeld Residuals for average glucose level")
+plot(aic_model_with_smoke_zph[3], main = "Scaled Schoenfeld Residuals for BMI")
+plot(aic_model_with_smoke_zph[3], main = "Scaled Schoenfeld Residuals for smoking status")
+```
+
+bmi and smoking status have very small p values, suggesting that they might violate the proportional hazard assumption.
+
+
+# Adressing the violation of PH assumption
+
+We can try use a time variant coefficient and try to fix it but it is hard to tell from the plot what the trend is like.
+
+Or we can also try a simpler approach, we can try stratify both of these variables, and fit different Cox-ph models on these strata. It is like saying, I know the hazard ratio of group A vs B changes over time, so I might as well not bother with their hazard ratio and just estimate the hazard ratio of the other covariates while adjusting their baseline risk according to whether the sample falls in group A or B.
+
+Or... and I might sound crazy, but the simplest approach is to leave it be. The violation of the proportional hazard assumption does not always pose a concern for our analysis. The estimates given for the variables where proportional hazard assumption does not hold can be interpreted as the average effect.
+
+Before we decide which strategy we should go for, we can plot out the survival curves of each strata and decide.
+
+We can first stratify BMI into say 3 strata
+```{r}
+imputed_complete_data_collapse_stratified <- 
+  imputed_complete_data_collapse %>% mutate(
+  bmi_strata = ntile(bmi, 3) %>% 
+    factor(labels = c("Low BMI", "Medium BMI", "High BMI"))
+)
+  
+```
+
+I know, the name is getting ridiculous but now we can plot out the survival curves for different strata of bmi and smoking status
+
+```{r}
+km_fit_bmi <- survfit(stroke.surv ~ bmi_strata, 
+                      data = imputed_complete_data_collapse_stratified)
+plot(km_fit_bmi, col = 1:3, xlab = "Age", ylab = "Survival Probability", 
+     main = "Kaplan-Meier Survival Curves by BMI Strata", xlim = c(40,90))
+legend("bottomright", legend = levels(imputed_complete_data_collapse_stratified$bmi_strata), 
+       col = 1:3, lty = 1, cex = 0.8)
+```
+
+```{r}
+km_fit_smoke <- survfit(stroke.surv ~ smoking_status, data = imputed_complete_data_collapse_stratified)
+plot(km_fit_smoke, col = 1:3, xlab = "Age", ylab = "Survival Probability", 
+     main = "Kaplan-Meier Survival Curves by Smoking Status", xlim = c(40,90))
+legend("bottomright", legend = 
+         levels(imputed_complete_data_collapse_stratified$smoking_status), 
+       col = 1:3, lty = 1, cex = 0.8)
+```
+Oof, looks like both plots show clear convergence of curves, which is a tale-tell sign that the proportional hazard violation is severe. Given our decent sample size, it is likely more than just noisy data.
+
+It might be worth it to try the stratified Cox-ph model. and do a side by side comparison
+
+# Comparing stratified model and un-stratified model
+
+```{r echo=FALSE}
+stratified_ph_model <- coxph(stroke.surv ~ work_type + avg_glucose_level + 
+                              strata(bmi_strata) + strata(smoking_status),
+                            data = imputed_complete_data_collapse_stratified)
+cat("stratified_ph_model summary: \n")
+summary(stratified_ph_model)$coefficient
+cat("-------------------------------------------------------------------------------- \n")
+cat("aic_model_with_smoke summary: \n")
+summary(aic_model_with_smoke)$coefficient
+```
+We see, we have a much more significant p-values for the stratified model. It is because we have accounted for different base line risk function between each strata and prevented the skewness introduced in the old model.
+
+But it is a trade-off. Even though the stratified_ph_model better models the relationship of the covariates and the risk, we do lose the information on how bmi and smoking status can affect the risk. Even if the estimates in the old model are technically incorrect, they can still be useful because as mentioned before, they can be interpreted as the average effect.
+
+If we still want that information, we can employ a time transform function on bmi and smoking status. However, modeling this interaction requires a lot more effort and some specialty knowledge. That is beyond the scope of this project and honestly, it is kind of above my pay-grade without a lot more reading :( 
+
+So let's just move on...
+
+But now we need to choose whether we should use the stratified model or not, and there is arguments to be made for both. In this case I will go on with the stratified model.
+
+Now that we are done with all the diagnostic, I want to give you a friendly reminder that all the model fitted so far used only one instance of the imputed data, to get a valid estimation, we need to consider all the imputed data set.
+
+# Obtaining the valid estimates by pooling all the imputed data sets
+
+But first we need to collapse the factor of work_type like we did for imputed_complete_data_collapse across all the data set.
+
+```{r}
+completed_datasets <- complete(imputed_data, "long", include = TRUE)
+
+completed_datasets_collapsed <- completed_datasets %>%
+  mutate(
+    work_type = fct_collapse(work_type,
+      Govt_job = "Govt_job",
+      'Self-employed' = "Self-employed",
+      Other = c("children", "Never_worked", "Private")
+    ),
+    work_type = relevel(work_type, ref = "Govt_job"),
+    bmi_strata = ntile(bmi, 3) %>% 
+    factor(labels = c("Low BMI", "Medium BMI", "High BMI"))
+  )
+
+
+imputed_data_collapsed <- as.mids(completed_datasets_collapsed)
+```
+
+Now we can use the full imputed data set in our final model
+
+```{r}
+imputed_final_ph <- with(imputed_data_collapsed, 
+                         coxph(stroke.surv ~ work_type + avg_glucose_level + strata(bmi_strata) + strata(smoking_status)))
+
+pooled_final_ph <- pool(imputed_final_ph)
+```
+
+
+```{r echo=FALSE}
+
+cat("pooled_final_ph summary: \n")
+summary(pooled_final_ph)
+
+confint_table <- pooled_final_ph %>%
+  summary() %>%
+  mutate(
+    Lower_95_CI = estimate - 1.96 * std.error,
+    Upper_95_CI = estimate + 1.96 * std.error
+  ) %>% dplyr::select(term, Lower_95_CI, Upper_95_CI)
+cat("-------------------------------------------------------------------------------- \n")
+cat("Estimated 95% CI \n")
+confint_table
+```
+Phew, that was a lot of work, but at last we obtained the final model that we have by using the imputation approach.
+
+# Comparing our results to complete case analysis
+
+Now that we are done with multiple imputation, we can now do a complete case analysis where all the observations containing NA values are dropped.
+
+For this to be statistically valid, we need to assume the data is missing completely at random (MCAR), which is a strong assumption that states the probability of the data missing does not depend on the observed data. This could be unrealistic but this section only serves as a sensitivity analysis so it does not pose a major concern for us.
+
+```{r}
+data_dropped <- data_clean %>% drop_na()
+sapply(data_dropped %>% dplyr::select(age, 
+  avg_glucose_level, bmi, smoking_status), function(x) sum(is.na(x)))
+```
+And then we also need the same releveling and factor collapsing for data_dropped as in imputed_complete_data_collapse for a fair comparison.
+
+```{r}
+data_dropped_collapse <- data_dropped %>% mutate(
+  work_type = fct_collapse(work_type,
+                           Govt_job = "Govt_job",
+                           'Self-employed' = "Self-employed",
+                           Other = c("children", "Never_worked", "Private")
+  ),
+  work_type = relevel(work_type, ref = "Govt_job"),
+  bmi_strata = ntile(bmi, 3) %>% 
+    factor(labels = c("Low BMI", "Medium BMI", "High BMI"))
+)
+```
+
+Now we can run the same model as before on this complete data set and do a side by side comparison
+
+```{r}
+stroke.surv_dropped <- Surv(data_dropped_collapse$age, data_dropped_collapse$stroke)
+complete_case_ph <- coxph(stroke.surv_dropped ~ work_type + avg_glucose_level + 
+                            strata(bmi_strata) + strata(smoking_status),
+                          data = data_dropped_collapse)
+```
+
+
+```{r echo=FALSE}
+cat("pooled_final_ph summary: \n")
+summary(pooled_final_ph)[,-5] #removed the df term from this table to be more consistent
+cat("-------------------------------------------------------------------------------- \n")
+cat("complete_case_ph summary: \n")
+summary(complete_case_ph)$coefficient[,-2] #removed the exp(coef) term to be consistent
+```
+Because these 2 summary are coming from 2 different R objects, the names are going to be a bit different. But each column of one table are representing the same things to the corresponding column from the other table. i.e. coef == estimate.
+
+With that out of the way, we do see some very interesting results here. We see a drastically different p-value across all covariates. That said, the direction of the effects agree with each other (e.g. avg_glucose_level increases the risk in both level).
+
+The difference in p-value could be due to a few potential issues:
+
+1. We used too little imputations, 20-40 imputations is the standard, we used 5 only.
+
+2. It could be the case that smoking status cannot be accurately predicted by our simple imputation scheme, and hence we produced noisy imputed data that skews the result. For example, we might mispecified bmi as having a linear association with other covariate when the real association is non linear. Leading to the discrepency.
+
+3. It could also be the case that the data is genuinely not missing at random (NMAR) and our prediction systematically bias toward certain values, leading to poor predictions. While at the same time, dropping observations with NA values also introduce a different bias.
+
+4. We could simply have too many missing data, rendering our imputed model unstable and perhaps by chance, had a very different result from the model that runs on the complete data set.
+
+5. We have different number of observations in the 2 data sets, leading to the different estimates of the std.error.
+
+But overall, they seem largely consistent. Usually, the imputed model is preferred because it is potentially less biased than the complete case model. Complete case case could yield worse result if the missing probability depends on the response variable, and only similar result to imputed model otherwise. So imputed data model generally outperforms complete case model.
+
+# Lesson learned and summary
+
+In this project, various techniques in survival modeling and multiple imputation are employed including KM curves, proportional hazard model and its stratified variant, multiple imputation, diagnostics and sensitivity analysis.
+
+Upon reviewing it and thanks to the feed back from Onur Ramazan, I have identified several potential pitfall.
+
+1. More chains should be used when imputing the data, 20 to 40 is generally the standard,
+
+2. I started this project without a hypothesis in mind even though the number of variables is not that big. Instead I did a data driven approach which could inflate type I error. If the number of variables is not that big, confirmatory analysis is the gold standard.
+
+3. I trusted the p-value after stepwise selection is run. However the p-value is already invalid after the model selection event. Selective inference could be performed if valid p-value is required after model selection (using LASSO).
+
+4. The way the model is picked is based off of only one imputed data set. This ignores the variability between different data set as different models could be picked in other data set. MI-LASSO, majority rule, stacked analysis and Wald's multivariate test could be used to rigorously pick a model accounting for all the different data set.
+
+5. When performing G test on the independence of work_type, Fisher's exact test should have been used for a more robust result given the small cell count.
+
+These mistakes have been noted and will be surely be avoided in my coming analysis.
+
+This project has been a fruitful one, I have put many of the theory that I have learned into use and learn how these techniques interact with imperfect data. It is also intellectually stimulating to constantly contemplate different approaches to a problem and the assumptions that allow our techniques to work. And upon reviewing my work, I have discovered many new things, some of which (such as MI-LASSO and selective inference) are really technical graduate level material, and researching them has been incredibly eye opening.
+
+If you have made it this far to my analysis, I want to say thank you and hopefully it has been as entertaining for you as it is for me to work on it. If you have any feedback or spotted any other mistakes that I did not realize, feel free to point them out! I am still learning.
+
+That's it for now!
